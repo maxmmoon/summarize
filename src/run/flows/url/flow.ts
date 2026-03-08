@@ -40,6 +40,7 @@ import {
   logExtractionDiagnostics,
 } from "./extract.js";
 import { createMarkdownConverters } from "./markdown.js";
+import { createUrlProgressStatus } from "./progress-status.js";
 import { createSlidesTerminalOutput } from "./slides-output.js";
 import { buildUrlPrompt, outputExtractedUrl, summarizeExtractedUrl } from "./summary.js";
 import type { UrlFlowContext } from "./types.js";
@@ -176,6 +177,11 @@ export async function runUrlFlow({
     if (!match) return styleLabel(text);
     return `${styleLabel(match[1])}${styleDim(`:${match[2]}`)}`;
   };
+  const progressStatus = createUrlProgressStatus({
+    enabled: flags.progressEnabled,
+    spinner,
+    oscProgress,
+  });
   const handleSignal = () => {
     try {
       spinner.stopAndClear();
@@ -200,12 +206,10 @@ export async function runUrlFlow({
     hooks.onSlidesProgress = (text: string) => {
       const match = text.match(/(\d{1,3})%/);
       const percent = match ? Number(match[1]) : null;
-      spinner.setText(renderStatusFromText(text));
-      if (Number.isFinite(percent) && percent !== null) {
-        oscProgress.setPercent("Slides", Math.max(0, Math.min(100, percent)));
-      } else {
-        oscProgress.setIndeterminate("Slides");
-      }
+      progressStatus.setSlides(
+        renderStatusFromText(text),
+        Number.isFinite(percent) && percent !== null ? percent : null,
+      );
     };
   }
   const websiteProgress = createWebsiteProgress({
@@ -457,7 +461,7 @@ export async function runUrlFlow({
       clearProgressForStdout: hooks.clearProgressForStdout,
       restoreProgressAfterStdout: hooks.restoreProgressAfterStdout ?? null,
       onProgressText: flags.progressEnabled
-        ? (text) => spinner.setText(renderStatusFromText(text))
+        ? (text) => progressStatus.setSlides(renderStatusFromText(text))
         : null,
     });
 
@@ -471,6 +475,7 @@ export async function runUrlFlow({
       };
       hooks.onSlidesDone = (result) => {
         existingSlidesDone?.(result);
+        progressStatus.clearSlides();
         slidesOutput.onSlidesDone(result);
       };
       hooks.onSlideChunk = (chunk) => {
@@ -482,6 +487,7 @@ export async function runUrlFlow({
     const markSlidesDone = (result: { ok: boolean; error?: string | null }) => {
       if (slidesDone) return;
       slidesDone = true;
+      progressStatus.clearSlides();
       hooks.onSlidesDone?.(result);
     };
 
@@ -529,8 +535,7 @@ export async function runUrlFlow({
           );
         }
         if (flags.progressEnabled) {
-          spinner.setText(renderStatus("Extracting slides"));
-          oscProgress.setIndeterminate("Extracting slides");
+          progressStatus.setSlides(renderStatus("Extracting slides"));
         }
         // Prefer indeterminate progress until we get real percentage updates from the slide pipeline.
         ctx.hooks.onSlidesProgress?.("Slides: extracting");
@@ -609,15 +614,13 @@ export async function runUrlFlow({
     const updateSummaryProgress = () => {
       if (!flags.progressEnabled) return;
       websiteProgress?.stop?.();
-      if (!flags.extractMode) {
-        oscProgress.setIndeterminate("Summarizing");
-      }
-      spinner.setText(
+      progressStatus.setSummary(
         flags.extractMode
           ? `${styleLabel("Extracted")}${styleDim(
               ` (${extractionUi.contentSizeLabel}${extractionUi.viaSourceLabel})`,
             )}`
           : formatSummaryProgress(),
+        flags.extractMode ? null : "Summarizing",
       );
     };
 
@@ -807,7 +810,7 @@ export async function runUrlFlow({
     const onModelChosen = (modelId: string) => {
       hooks.onModelChosen?.(modelId);
       if (!flags.progressEnabled) return;
-      spinner.setText(formatSummaryProgress(modelId));
+      progressStatus.setSummary(formatSummaryProgress(modelId), "Summarizing");
     };
 
     await summarizeExtractedUrl({

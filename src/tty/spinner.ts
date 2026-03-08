@@ -39,6 +39,7 @@ export function startSpinner({
 
   let ended = false;
   let paused = false;
+  let lastRenderAt = 0;
 
   const oraStream = stream as typeof stream & {
     cursorTo?: (x: number, y?: number) => void;
@@ -92,7 +93,13 @@ export function startSpinner({
     if (!hasVisibleText(next)) return;
     if (spinner.text === next) return;
     spinner.text = next;
-    if (!paused) spinner.render?.();
+    if (!paused) {
+      const now = Date.now();
+      if (now - lastRenderAt >= 80) {
+        lastRenderAt = now;
+        spinner.render?.();
+      }
+    }
   };
 
   const spinner = ora({

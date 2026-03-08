@@ -91,6 +91,8 @@ describe("tty spinner", () => {
   });
 
   it("ignores empty/ansi-only and duplicate text updates", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
     oraMock.mockReset();
     const renderSpy = vi.fn();
     const spinnerState = {
@@ -110,8 +112,13 @@ describe("tty spinner", () => {
     spinner.setText("\u001b[36m\u001b[0m");
     spinner.setText("Loading");
     spinner.setText("Next");
+    vi.setSystemTime(1_050);
+    spinner.setText("Later");
+    vi.setSystemTime(1_100);
+    spinner.setText("Latest");
 
-    expect(renderSpy).toHaveBeenCalledTimes(1);
-    expect(spinnerState.text).toBe("Next");
+    expect(renderSpy).toHaveBeenCalledTimes(2);
+    expect(spinnerState.text).toBe("Latest");
+    vi.useRealTimers();
   });
 });
