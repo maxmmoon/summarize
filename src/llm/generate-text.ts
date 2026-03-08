@@ -2,6 +2,7 @@ import type { Context, Message } from "@mariozechner/pi-ai";
 import { completeSimple, streamSimple } from "@mariozechner/pi-ai";
 import { createUnsupportedFunctionalityError } from "./errors.js";
 import { parseGatewayStyleModelId } from "./model-id.js";
+import { supportsDocumentAttachments, supportsStreaming } from "./provider-capabilities.js";
 import { type Prompt, userTextAndImageMessage } from "./prompt.js";
 import {
   completeAnthropicDocument,
@@ -223,6 +224,11 @@ export async function generateTextWithModelId({
     if (attachments.length !== 1) {
       throw new Error("Internal error: document attachments cannot be combined with other inputs.");
     }
+    if (!supportsDocumentAttachments(parsed.provider)) {
+      throw createUnsupportedFunctionalityError(
+        `document attachments are not supported for ${parsed.provider}/... models`,
+      );
+    }
     if (parsed.provider === "anthropic") {
       const apiKey = apiKeys.anthropicApiKey;
       if (!apiKey) throw new Error("Missing ANTHROPIC_API_KEY for anthropic/... model");
@@ -329,9 +335,6 @@ export async function generateTextWithModelId({
       }
     }
 
-    throw createUnsupportedFunctionalityError(
-      `document attachments are not supported for ${parsed.provider}/... models`,
-    );
   }
 
   const context = promptToContext(prompt);
@@ -631,6 +634,11 @@ export async function streamTextWithContext({
   lastError: () => unknown;
 }> {
   const parsed = parseGatewayStyleModelId(modelId);
+  if (!supportsStreaming(parsed.provider)) {
+    throw createUnsupportedFunctionalityError(
+      `streaming is not supported for ${parsed.provider}/... models`,
+    );
+  }
   const effectiveTemperature = resolveEffectiveTemperature({ parsed, temperature });
   void fetchImpl;
 
