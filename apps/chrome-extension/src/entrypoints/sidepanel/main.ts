@@ -13,10 +13,9 @@ import {
   splitSummaryFromSlides,
 } from "../../../../../src/run/flows/url/slides-text.js";
 import type { SummaryLength } from "../../../../../src/shared/contracts.js";
-import { parseSseEvent, type SseSlidesData } from "../../../../../src/shared/sse-events.js";
+import type { SseSlidesData } from "../../../../../src/shared/sse-events.js";
 import { listSkills } from "../../automation/skills-store";
 import { executeToolCall, getAutomationToolNames } from "../../automation/tools";
-import { readPresetOrCustomValue } from "../../lib/combo";
 import { buildIdleSubtitle } from "../../lib/header";
 import {
   defaultSettings,
@@ -24,15 +23,20 @@ import {
   patchSettings,
   type SlidesLayout,
 } from "../../lib/settings";
-import { parseSseStream } from "../../lib/sse";
 import { applyTheme } from "../../lib/theme";
 import { generateToken } from "../../lib/token";
 import { mountCheckbox } from "../../ui/zag-checkbox";
 import { ChatController } from "./chat-controller";
-import { type ChatHistoryLimits, compactChatHistory } from "./chat-state";
+import {
+  buildEmptyUsage,
+  createChatHistoryStore,
+  normalizeStoredMessage,
+} from "./chat-history-store";
+import { compactChatHistory, type ChatHistoryLimits } from "./chat-state";
 import { createErrorController } from "./error-controller";
 import { createHeaderController } from "./header-controller";
 import { createMetricsController } from "./metrics-controller";
+import { createModelPresetsController } from "./model-presets";
 import { createPanelCacheController, type PanelCachePayload } from "./panel-cache";
 import {
   mountSidepanelLengthPicker,
@@ -47,14 +51,17 @@ import {
   shouldAcceptSlidesForCurrentPage,
   shouldInvalidateCurrentSource,
 } from "./session-policy";
+import { installStepsHtml, wireSetupButtons } from "./setup-view";
 import { createSlideImageLoader, normalizeSlideImageUrl } from "./slide-images";
 import { chooseSlideDescription, sanitizeSlideSummaryTitle } from "./slide-text-policy";
 import { createSlidesHydrator } from "./slides-hydrator";
 import { resolveSlidesPayload, slidesPayloadChanged } from "./slides-payload";
 import { hasResolvedSlidesPayload } from "./slides-pending";
+import { createSlidesRenderer } from "./slides-renderer";
 import { resolveSlidesRenderLayout, shouldHideSummaryForSlides } from "./slides-view-policy";
 import { createStreamController } from "./stream-controller";
 import { buildSummaryEmptyState } from "./summary-empty-state";
+import { linkifyTimestamps, parseTimestampHref } from "./timestamp-links";
 import type { ChatMessage, PanelPhase, PanelState, RunStart, UiState } from "./types";
 import { createTypographyController } from "./typography-controller";
 
@@ -302,7 +309,6 @@ type ChatQueueItem = {
   createdAt: number;
 };
 let chatQueue: ChatQueueItem[] = [];
-const chatHistoryCache = new Map<number, ChatMessage[]>();
 let chatHistoryLoadId = 0;
 let activeTabId: number | null = null;
 let activeTabUrl: string | null = null;
@@ -353,6 +359,7 @@ const AGENT_NAV_TTL_MS = 20_000;
 type AgentNavigation = { url: string; tabId: number | null; at: number };
 let lastAgentNavigation: AgentNavigation | null = null;
 let pendingPreserveChatForUrl: { url: string; at: number } | null = null;
+const chatHistoryStore = createChatHistoryStore({ chatLimits });
 
 const chatController = new ChatController({
   messagesEl: chatMessagesEl,
@@ -782,22 +789,14 @@ function retrySlidesStream() {
 }
 
 function applySlidesLayout() {
-  const effectiveInputMode = inputModeOverride ?? inputMode;
-  const renderLayout = resolveSlidesRenderLayout({
+  renderMarkdownHostEl.classList.remove("hidden");
+  renderSlidesHostEl.dataset.layout = resolveSlidesRenderLayout({
     preferredLayout: slidesLayoutValue,
     slidesEnabled: slidesEnabledValue,
-    inputMode: effectiveInputMode,
+    inputMode: inputModeOverride ?? inputMode,
   });
-  const isGallery = renderLayout === "gallery";
-  renderMarkdownHostEl.classList.remove("hidden");
-  renderSlidesHostEl.dataset.layout = renderLayout;
-  if (isGallery) {
-    clearSlideStrip(renderSlidesHostEl);
-  } else {
-    clearSlideGallery(renderSlidesHostEl);
-  }
   renderMarkdownDisplay();
-  queueSlidesRender();
+  slidesRenderer.applyLayout();
 }
 
 function setSlidesLayout(next: SlidesLayout) {
@@ -1067,14 +1066,7 @@ async function migrateChatHistory(fromTabId: number | null, toTabId: number | nu
   if (!fromTabId || !toTabId || fromTabId === toTabId) return;
   const messages = chatController.getMessages();
   if (messages.length === 0) return;
-  chatHistoryCache.set(toTabId, messages);
-  const store = chrome.storage?.session;
-  if (!store) return;
-  try {
-    await store.set({ [getChatHistoryKey(toTabId)]: messages });
-  } catch {
-    // ignore
-  }
+  await chatHistoryStore.persist(toTabId, messages, true);
 }
 
 async function appendNavigationMessage(url: string, title: string | null) {
@@ -1154,8 +1146,7 @@ function resetSummaryView({
   currentRunTabId = null;
   renderEl.replaceChildren(renderSlidesHostEl, renderMarkdownHostEl);
   renderMarkdownHostEl.innerHTML = "";
-  clearSlideStrip(renderSlidesHostEl);
-  clearSlideGallery(renderSlidesHostEl);
+  slidesRenderer.clear();
   metricsController.clearForMode("summary");
   panelState.summaryMarkdown = null;
   panelState.summaryFromCache = null;
@@ -1713,11 +1704,26 @@ function updateSlideMeta(
   el.textContent = slideLabel;
 }
 
-function bindSlideSeek(el: HTMLElement, timestamp: number | null | undefined) {
-  el.onclick = () => {
-    seekToSlideTimestamp(timestamp);
-  };
-}
+const slidesRenderer = createSlidesRenderer({
+  hostEl: renderSlidesHostEl,
+  markdownHostEl: renderMarkdownHostEl,
+  getState: () => ({
+    slidesEnabled: slidesEnabledValue,
+    inputMode: inputModeOverride ?? inputMode,
+    preferredLayout: slidesLayoutValue,
+    slidesExpanded,
+    slides: panelState.slides,
+    descriptions: slideDescriptions,
+    titles: slideTitleByIndex,
+  }),
+  ensureDescriptions: rebuildSlideDescriptions,
+  onSeek: seekToSlideTimestamp,
+  setExpanded: (next) => {
+    slidesExpanded = next;
+  },
+  updateThumb: updateSlideThumb,
+  updateMeta: updateSlideMeta,
+});
 
 function applySlidesPayload(data: SseSlidesData) {
   const isSameSource = Boolean(panelState.slides && panelState.slides.sourceId === data.sourceId);
@@ -1856,13 +1862,7 @@ if (slidesTestHooks) {
     slidesEnabledValue = true;
     inputMode = "video";
     inputModeOverride = "video";
-    if (slidesLayoutValue === "gallery") {
-      renderSlideGallery(renderSlidesHostEl);
-    } else {
-      slidesLayoutValue = "strip";
-      renderSlideStrip(renderSlidesHostEl);
-    }
-    return renderSlidesHostEl.children.length;
+    return slidesRenderer.forceRender();
   };
   slidesTestHooks.showInlineError = (message) => {
     errorController.showInlineError(message);
@@ -1882,407 +1882,12 @@ async function requestSlidesContext() {
   void send({ type: "panel:slides-context", requestId, url: sourceUrl ?? undefined });
 }
 
-const MAX_SLIDE_STRIP = 12;
-let slideStripRenderQueued = 0;
-let slideGalleryRenderQueued = 0;
-
 function queueSlidesRender() {
-  const effectiveInputMode = inputModeOverride ?? inputMode;
-  const renderLayout = resolveSlidesRenderLayout({
-    preferredLayout: slidesLayoutValue,
-    slidesEnabled: slidesEnabledValue,
-    inputMode: effectiveInputMode,
-  });
-  if (renderLayout === "gallery") {
-    queueSlideGalleryRender();
-  } else {
-    queueSlideStripRender();
-  }
-}
-
-function shouldRenderSlides() {
-  if (!slidesEnabledValue) return false;
-  const effectiveInputMode = inputModeOverride ?? inputMode;
-  return effectiveInputMode === "video";
-}
-
-function queueSlideStripRender() {
-  const effectiveInputMode = inputModeOverride ?? inputMode;
-  const renderLayout = resolveSlidesRenderLayout({
-    preferredLayout: slidesLayoutValue,
-    slidesEnabled: slidesEnabledValue,
-    inputMode: effectiveInputMode,
-  });
-  if (renderLayout !== "strip") {
-    clearSlideStrip(renderSlidesHostEl);
-    return;
-  }
-  if (slideStripRenderQueued) return;
-  slideStripRenderQueued = window.setTimeout(() => {
-    slideStripRenderQueued = 0;
-    renderSlideStrip(renderSlidesHostEl);
-  }, 120);
-}
-
-function queueSlideGalleryRender() {
-  const effectiveInputMode = inputModeOverride ?? inputMode;
-  const renderLayout = resolveSlidesRenderLayout({
-    preferredLayout: slidesLayoutValue,
-    slidesEnabled: slidesEnabledValue,
-    inputMode: effectiveInputMode,
-  });
-  if (renderLayout !== "gallery") {
-    clearSlideGallery(renderSlidesHostEl);
-    return;
-  }
-  if (slideGalleryRenderQueued) return;
-  slideGalleryRenderQueued = window.setTimeout(() => {
-    slideGalleryRenderQueued = 0;
-    renderSlideGallery(renderSlidesHostEl);
-  }, 120);
-}
-
-function clearSlideStrip(container: HTMLElement) {
-  const existing = container.querySelector(".slideStrip");
-  if (existing) existing.remove();
-}
-
-function clearSlideGallery(container: HTMLElement) {
-  const existing = container.querySelector(".slideGallery");
-  if (existing) existing.remove();
-}
-
-function renderSlideStrip(container: HTMLElement) {
-  const effectiveInputMode = inputModeOverride ?? inputMode;
-  const renderLayout = resolveSlidesRenderLayout({
-    preferredLayout: slidesLayoutValue,
-    slidesEnabled: slidesEnabledValue,
-    inputMode: effectiveInputMode,
-  });
-  if (renderLayout !== "strip") {
-    clearSlideStrip(container);
-    return;
-  }
-  if (!shouldRenderSlides()) {
-    clearSlideStrip(container);
-    return;
-  }
-  if (!panelState.slides) return;
-  if (panelState.slides.slides.length > 0 && slideDescriptions.size === 0) {
-    rebuildSlideDescriptions();
-  }
-  const allSlides = panelState.slides.slides;
-  const slides = slidesExpanded ? allSlides : allSlides.slice(0, MAX_SLIDE_STRIP);
-  if (allSlides.length === 0 || slides.length === 0) {
-    clearSlideStrip(container);
-    return;
-  }
-
-  const existing = container.querySelector<HTMLDivElement>(".slideStrip");
-  const sourceId = panelState.slides.sourceId;
-  const expectedMode = slidesExpanded ? "expanded" : "collapsed";
-  if (
-    !existing ||
-    existing.dataset.sourceId !== sourceId ||
-    existing.dataset.mode !== expectedMode
-  ) {
-    clearSlideStrip(container);
-    const root = document.createElement("div");
-    root.className = "slideStrip";
-    root.dataset.sourceId = sourceId;
-    root.dataset.mode = expectedMode;
-
-    const header = document.createElement("div");
-    header.className = "slideStrip__header";
-
-    const title = document.createElement("div");
-    title.className = "slideStrip__title";
-    header.appendChild(title);
-
-    const toggle = document.createElement("button");
-    toggle.type = "button";
-    toggle.className = "slideStrip__toggle";
-    toggle.addEventListener("click", () => {
-      slidesExpanded = !slidesExpanded;
-      renderSlideStrip(container);
-    });
-    header.appendChild(toggle);
-    root.appendChild(header);
-
-    const grid = document.createElement("div");
-    grid.className = "slideStrip__grid";
-    root.appendChild(grid);
-    container.prepend(root);
-  }
-
-  const root = container.querySelector<HTMLDivElement>(".slideStrip");
-  if (!root) return;
-  root.dataset.sourceId = sourceId;
-  root.dataset.mode = expectedMode;
-
-  const header = root.querySelector<HTMLDivElement>(".slideStrip__header");
-  const title = root.querySelector<HTMLDivElement>(".slideStrip__title");
-  const toggle = root.querySelector<HTMLButtonElement>(".slideStrip__toggle");
-  const grid = root.querySelector<HTMLDivElement>(".slideStrip__grid");
-  if (!header || !title || !toggle || !grid) return;
-
-  const total = allSlides.length;
-  title.textContent =
-    !slidesExpanded && total > slides.length
-      ? `Slides (${total}) · showing ${slides.length}`
-      : `Slides (${total})`;
-  toggle.textContent = slidesExpanded ? "Collapse" : "Expand";
-  toggle.setAttribute("aria-pressed", slidesExpanded ? "true" : "false");
-  if (slidesExpanded) {
-    grid.classList.add("isExpanded");
-  } else {
-    grid.classList.remove("isExpanded");
-  }
-
-  const existingButtons = new Map<number, HTMLButtonElement>();
-  for (const button of Array.from(grid.querySelectorAll<HTMLButtonElement>(".slideStrip__item"))) {
-    const idxRaw = button.dataset.slideIndex;
-    const idx = idxRaw ? Number(idxRaw) : Number.NaN;
-    if (!Number.isFinite(idx)) continue;
-    existingButtons.set(idx, button);
-  }
-
-  const wanted = new Set<number>(slides.map((slide) => slide.index));
-  for (const [idx, button] of existingButtons) {
-    if (wanted.has(idx)) continue;
-    button.remove();
-    existingButtons.delete(idx);
-  }
-
-  for (const slide of slides) {
-    const idx = slide.index;
-    let button = existingButtons.get(idx);
-    if (!button) {
-      button = document.createElement("button");
-      button.type = "button";
-      button.className = "slideStrip__item";
-      button.dataset.slideIndex = String(idx);
-
-      const thumb = document.createElement("div");
-      thumb.className = "slideStrip__thumb";
-      const img = document.createElement("img");
-      img.alt = `Slide ${idx}`;
-      img.className = "slideStrip__thumbImage";
-      thumb.appendChild(img);
-
-      const meta = document.createElement("div");
-      meta.className = "slideStrip__meta";
-
-      button.appendChild(thumb);
-      button.appendChild(meta);
-      grid.appendChild(button);
-      existingButtons.set(idx, button);
-    }
-
-    const thumb = button.querySelector<HTMLDivElement>(".slideStrip__thumb");
-    const img = button.querySelector<HTMLImageElement>("img.slideStrip__thumbImage");
-    const meta = button.querySelector<HTMLDivElement>(".slideStrip__meta");
-    if (!thumb || !img || !meta) continue;
-
-    updateSlideThumb(img, thumb, slide.imageUrl);
-    updateSlideMeta(meta, idx, slide.timestamp, slideTitleByIndex.get(idx) ?? null, slides.length);
-
-    const existingText = button.querySelector<HTMLDivElement>(".slideStrip__text");
-    if (slidesExpanded) {
-      if (!existingText) {
-        const description = document.createElement("div");
-        description.className = "slideStrip__text";
-        button.appendChild(description);
-      }
-      const textEl = button.querySelector<HTMLDivElement>(".slideStrip__text");
-      if (textEl) textEl.textContent = slideDescriptions.get(idx) ?? "";
-    } else if (existingText) {
-      existingText.remove();
-    }
-
-    bindSlideSeek(button, slide.timestamp);
-  }
-}
-
-function renderSlideGallery(container: HTMLElement) {
-  const effectiveInputMode = inputModeOverride ?? inputMode;
-  const renderLayout = resolveSlidesRenderLayout({
-    preferredLayout: slidesLayoutValue,
-    slidesEnabled: slidesEnabledValue,
-    inputMode: effectiveInputMode,
-  });
-  if (renderLayout !== "gallery") {
-    clearSlideGallery(container);
-    return;
-  }
-  if (!shouldRenderSlides()) {
-    clearSlideGallery(container);
-    return;
-  }
-  if (!panelState.slides) {
-    clearSlideGallery(container);
-    return;
-  }
-  if (panelState.slides.slides.length > 0 && slideDescriptions.size === 0) {
-    rebuildSlideDescriptions();
-  }
-  const slides = panelState.slides.slides;
-  if (slides.length === 0) {
-    clearSlideGallery(container);
-    return;
-  }
-
-  const sourceId = panelState.slides.sourceId;
-  let root = container.querySelector<HTMLDivElement>(".slideGallery");
-  if (!root || root.dataset.sourceId !== sourceId) {
-    clearSlideGallery(container);
-    root = document.createElement("div");
-    root.className = "slideGallery";
-    root.dataset.sourceId = sourceId;
-
-    const header = document.createElement("div");
-    header.className = "slideGallery__header";
-    const title = document.createElement("div");
-    title.className = "slideGallery__title";
-    header.appendChild(title);
-    root.appendChild(header);
-
-    const list = document.createElement("div");
-    list.className = "slideGallery__list";
-    root.appendChild(list);
-
-    container.prepend(root);
-  }
-
-  const title = root.querySelector<HTMLDivElement>(".slideGallery__title");
-  const list = root.querySelector<HTMLDivElement>(".slideGallery__list");
-  if (!title || !list) return;
-  title.textContent = `Slides (${slides.length})`;
-
-  const existingItems = new Map<number, HTMLElement>();
-  for (const item of Array.from(list.querySelectorAll<HTMLElement>(".slideGallery__item"))) {
-    const idxRaw = item.dataset.slideIndex;
-    const idx = idxRaw ? Number(idxRaw) : Number.NaN;
-    if (!Number.isFinite(idx)) continue;
-    existingItems.set(idx, item);
-  }
-
-  const wanted = new Set<number>(slides.map((slide) => slide.index));
-  for (const [idx, item] of existingItems) {
-    if (wanted.has(idx)) continue;
-    item.remove();
-    existingItems.delete(idx);
-  }
-
-  for (const slide of slides) {
-    const idx = slide.index;
-    let item = existingItems.get(idx);
-    if (!item) {
-      item = document.createElement("button");
-      item.type = "button";
-      item.className = "slideGallery__item";
-      item.dataset.slideIndex = String(idx);
-
-      const media = document.createElement("div");
-      media.className = "slideGallery__media";
-
-      const thumb = document.createElement("div");
-      thumb.className = "slideInline__thumb slideGallery__thumb isPlaceholder";
-      const img = document.createElement("img");
-      img.alt = `Slide ${idx}`;
-      img.className = "slideInline__thumbImage";
-      thumb.appendChild(img);
-      media.appendChild(thumb);
-
-      const body = document.createElement("div");
-      body.className = "slideGallery__body";
-      const meta = document.createElement("div");
-      meta.className = "slideGallery__meta";
-      const text = document.createElement("div");
-      text.className = "slideGallery__text";
-      body.append(meta, text);
-
-      item.append(media, body);
-      list.appendChild(item);
-      existingItems.set(idx, item);
-    }
-
-    const media = item.querySelector<HTMLDivElement>(".slideGallery__media");
-    const img = item.querySelector<HTMLImageElement>("img.slideInline__thumbImage");
-    const thumb = item.querySelector<HTMLDivElement>(".slideGallery__thumb");
-    const meta = item.querySelector<HTMLDivElement>(".slideGallery__meta");
-    const text = item.querySelector<HTMLDivElement>(".slideGallery__text");
-    if (!media || !img || !thumb || !meta || !text) continue;
-
-    updateSlideThumb(img, thumb, slide.imageUrl);
-    updateSlideMeta(meta, idx, slide.timestamp, slideTitleByIndex.get(idx) ?? null, slides.length);
-    text.textContent = slideDescriptions.get(idx) ?? "";
-
-    bindSlideSeek(item, slide.timestamp);
-    list.appendChild(item);
-  }
-}
-
-function stripSlidePlaceholders(container: HTMLElement) {
-  const placeholders = Array.from(container.querySelectorAll("span.slideInline"));
-  for (const placeholder of placeholders) {
-    placeholder.remove();
-  }
+  slidesRenderer.queueRender();
 }
 
 function renderInlineSlides(container: HTMLElement, opts?: { fallback?: boolean }) {
-  const isSummary = container === renderMarkdownHostEl;
-  if (isSummary) {
-    stripSlidePlaceholders(container);
-    if (opts?.fallback) queueSlidesRender();
-    return;
-  }
-  if (!panelState.slides) {
-    if (opts?.fallback) clearSlideStrip(renderSlidesHostEl);
-    return;
-  }
-  const slidesByIndex = new Map(panelState.slides.slides.map((slide) => [slide.index, slide]));
-  const slideTotal = panelState.slides.slides.length || slidesByIndex.size;
-  const placeholders = Array.from(container.querySelectorAll("span.slideInline"));
-  let replacedCount = 0;
-  for (const placeholder of placeholders) {
-    const indexAttr = placeholder.getAttribute("data-slide-index");
-    const index = indexAttr ? Number(indexAttr) : Number.NaN;
-    const slide = slidesByIndex.get(index);
-    if (!slide) continue;
-    const wrapper = document.createElement("div");
-    wrapper.className = "slideInline";
-    wrapper.dataset.slideIndex = String(index);
-    const button = document.createElement("button");
-    button.type = "button";
-    const thumb = document.createElement("div");
-    thumb.className = "slideInline__thumb isPlaceholder";
-    const img = document.createElement("img");
-    img.alt = `Slide ${index}`;
-    img.className = "slideInline__thumbImage";
-    updateSlideThumb(img, thumb, slide.imageUrl);
-    const caption = document.createElement("div");
-    caption.className = "slideCaption";
-    updateSlideMeta(
-      caption,
-      index,
-      slide.timestamp,
-      slideTitleByIndex.get(index) ?? null,
-      slideTotal,
-    );
-    thumb.appendChild(img);
-    button.appendChild(thumb);
-    button.appendChild(caption);
-    bindSlideSeek(button, slide.timestamp);
-    wrapper.appendChild(button);
-    placeholder.replaceWith(wrapper);
-    replacedCount += 1;
-  }
-  if (opts?.fallback) {
-    if (replacedCount === 0) {
-      queueSlidesRender();
-    }
-  }
+  slidesRenderer.renderInline(container, opts);
 }
 
 const LINE_HEIGHT_STEP = 0.1;
@@ -2363,83 +1968,8 @@ function applyChatEnabled() {
   }
 }
 
-function getChatHistoryKey(tabId: number) {
-  return `chat:tab:${tabId}`;
-}
-
-function buildEmptyUsage() {
-  return {
-    input: 0,
-    output: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    totalTokens: 0,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-  };
-}
-
-function normalizeStoredMessage(raw: Record<string, unknown>): ChatMessage | null {
-  const role = raw.role;
-  const timestamp = typeof raw.timestamp === "number" ? raw.timestamp : Date.now();
-  const id = typeof raw.id === "string" ? raw.id : crypto.randomUUID();
-
-  if (role === "user") {
-    const content = raw.content;
-    if (typeof content !== "string" && !Array.isArray(content)) return null;
-    return { ...(raw as Message), role: "user", content, timestamp, id };
-  }
-
-  if (role === "assistant") {
-    const content = Array.isArray(raw.content)
-      ? raw.content
-      : typeof raw.content === "string"
-        ? [{ type: "text", text: raw.content }]
-        : [];
-    return {
-      ...(raw as Message),
-      role: "assistant",
-      content,
-      api: typeof raw.api === "string" ? raw.api : "openai-completions",
-      provider: typeof raw.provider === "string" ? raw.provider : "openai",
-      model: typeof raw.model === "string" ? raw.model : "unknown",
-      usage: typeof raw.usage === "object" && raw.usage ? raw.usage : buildEmptyUsage(),
-      stopReason: typeof raw.stopReason === "string" ? raw.stopReason : "stop",
-      timestamp,
-      id,
-    };
-  }
-
-  if (role === "toolResult") {
-    const content = Array.isArray(raw.content)
-      ? raw.content
-      : typeof raw.content === "string"
-        ? [{ type: "text", text: raw.content }]
-        : [];
-    return {
-      ...(raw as Message),
-      role: "toolResult",
-      content,
-      toolCallId: typeof raw.toolCallId === "string" ? raw.toolCallId : crypto.randomUUID(),
-      toolName: typeof raw.toolName === "string" ? raw.toolName : "tool",
-      isError: Boolean(raw.isError),
-      timestamp,
-      id,
-    };
-  }
-
-  return null;
-}
-
 async function clearChatHistoryForTab(tabId: number | null) {
-  if (!tabId) return;
-  chatHistoryCache.delete(tabId);
-  const store = chrome.storage?.session;
-  if (!store) return;
-  try {
-    await store.remove(getChatHistoryKey(tabId));
-  } catch {
-    // ignore
-  }
+  await chatHistoryStore.clear(tabId);
 }
 
 async function clearChatHistoryForActiveTab() {
@@ -2447,43 +1977,19 @@ async function clearChatHistoryForActiveTab() {
 }
 
 async function loadChatHistory(tabId: number): Promise<ChatMessage[] | null> {
-  const cached = chatHistoryCache.get(tabId);
-  if (cached) return cached;
-  const store = chrome.storage?.session;
-  if (!store) return null;
-  try {
-    const key = getChatHistoryKey(tabId);
-    const res = await store.get(key);
-    const raw = res?.[key];
-    if (!Array.isArray(raw)) return null;
-    const parsed = raw
-      .filter((msg) => msg && typeof msg === "object")
-      .map((msg) => normalizeStoredMessage(msg as Record<string, unknown>))
-      .filter((msg): msg is ChatMessage => Boolean(msg));
-    if (!parsed.length) return null;
-    chatHistoryCache.set(tabId, parsed);
-    return parsed;
-  } catch {
-    return null;
-  }
+  return chatHistoryStore.load(tabId);
 }
 
 async function persistChatHistory() {
   if (!chatEnabledValue) return;
   const tabId = activeTabId;
   if (!tabId) return;
-  const compacted = compactChatHistory(chatController.getMessages(), chatLimits);
-  if (compacted.length !== chatController.getMessages().length) {
+  const messages = chatController.getMessages();
+  const compacted = compactChatHistory(messages, chatLimits);
+  if (compacted.length !== messages.length) {
     chatController.setMessages(compacted, { scroll: false });
   }
-  chatHistoryCache.set(tabId, compacted);
-  const store = chrome.storage?.session;
-  if (!store) return;
-  try {
-    await store.set({ [getChatHistoryKey(tabId)]: compacted });
-  } catch {
-    // ignore
-  }
+  await chatHistoryStore.persist(tabId, compacted, chatEnabledValue);
 }
 
 async function restoreChatHistory() {
@@ -2509,9 +2015,8 @@ async function restoreChatHistory() {
       .map((msg) => normalizeStoredMessage(msg as Record<string, unknown>))
       .filter((msg): msg is ChatMessage => Boolean(msg));
     if (!parsed.length) return;
-    const compacted = compactChatHistory(parsed, chatLimits);
+    const compacted = await chatHistoryStore.persist(tabId, parsed, true);
     chatController.setMessages(compacted, { scroll: false });
-    await persistChatHistory();
   } catch {
     // ignore
   }
@@ -2541,241 +2046,26 @@ function friendlyFetchError(err: unknown, context: string): string {
   return `${context}: ${message}`;
 }
 
-function setModelStatus(text: string, state: "idle" | "running" | "error" | "ok" = "idle") {
-  modelStatusEl.textContent = text;
-  if (state === "idle") {
-    modelStatusEl.removeAttribute("data-state");
-  } else {
-    modelStatusEl.setAttribute("data-state", state);
-  }
-}
-
-function setDefaultModelPresets() {
-  modelPresetEl.innerHTML = "";
-  const auto = document.createElement("option");
-  auto.value = "auto";
-  auto.textContent = "Auto";
-  modelPresetEl.append(auto);
-  const free = document.createElement("option");
-  free.value = "free";
-  free.textContent = "Free";
-  modelPresetEl.append(free);
-  const custom = document.createElement("option");
-  custom.value = "custom";
-  custom.textContent = "Custom…";
-  modelPresetEl.append(custom);
-}
-
-function setModelPlaceholderFromDiscovery(discovery: {
-  providers?: unknown;
-  localModelsSource?: unknown;
-}) {
-  const hints: string[] = ["auto"];
-  const providers = discovery.providers;
-  if (providers && typeof providers === "object") {
-    const p = providers as Record<string, unknown>;
-    if (p.openrouter === true) hints.push("free");
-    if (p.openai === true) hints.push("openai/…");
-    if (p.anthropic === true) hints.push("anthropic/…");
-    if (p.google === true) hints.push("google/…");
-    if (p.xai === true) hints.push("xai/…");
-    if (p.zai === true) hints.push("zai/…");
-  }
-  if (discovery.localModelsSource && typeof discovery.localModelsSource === "object") {
-    hints.push("local: openai/<id>");
-  }
-  modelCustomEl.placeholder = hints.join(" / ");
-}
-
-function readCurrentModelValue(): string {
-  return readPresetOrCustomValue({
-    presetValue: modelPresetEl.value,
-    customValue: modelCustomEl.value,
-    defaultValue: defaultSettings.model,
-  });
-}
-
-function updateModelRowUI() {
-  const isCustom = modelPresetEl.value === "custom";
-  modelCustomEl.hidden = !isCustom;
-  modelRowEl.classList.toggle("isCustom", isCustom);
-  modelRefreshBtn.hidden = modelPresetEl.value !== "free";
-}
-
-function setModelValue(value: string) {
-  const next = value.trim() || defaultSettings.model;
-  const optionValues = new Set(Array.from(modelPresetEl.options).map((o) => o.value));
-  if (optionValues.has(next) && next !== "custom") {
-    modelPresetEl.value = next;
-    updateModelRowUI();
-    return;
-  }
-  modelPresetEl.value = "custom";
-  updateModelRowUI();
-  modelCustomEl.value = next;
-}
-
-function captureModelSelection() {
-  return {
-    presetValue: modelPresetEl.value,
-    customValue: modelCustomEl.value,
-  };
-}
-
-function restoreModelSelection(selection: { presetValue: string; customValue: string }) {
-  if (selection.presetValue === "custom") {
-    modelPresetEl.value = "custom";
-    updateModelRowUI();
-    modelCustomEl.value = selection.customValue;
-    return;
-  }
-  const optionValues = new Set(Array.from(modelPresetEl.options).map((o) => o.value));
-  if (optionValues.has(selection.presetValue) && selection.presetValue !== "custom") {
-    modelPresetEl.value = selection.presetValue;
-    updateModelRowUI();
-    return;
-  }
-  setModelValue(selection.presetValue);
-}
-
-async function refreshModelPresets(token: string) {
-  const selection = captureModelSelection();
-  const trimmed = token.trim();
-  if (!trimmed) {
-    setDefaultModelPresets();
-    setModelPlaceholderFromDiscovery({});
-    restoreModelSelection(selection);
-    return;
-  }
-  try {
-    const res = await fetch("http://127.0.0.1:8787/v1/models", {
-      headers: { Authorization: `Bearer ${trimmed}` },
-    });
-    if (!res.ok) {
-      setDefaultModelPresets();
-      restoreModelSelection(selection);
-      return;
-    }
-    const json = (await res.json()) as unknown;
-    if (!json || typeof json !== "object") return;
-    const obj = json as Record<string, unknown>;
-    if (obj.ok !== true) return;
-
-    setModelPlaceholderFromDiscovery({
-      providers: obj.providers,
-      localModelsSource: obj.localModelsSource,
-    });
-
-    const optionsRaw = obj.options;
-    if (!Array.isArray(optionsRaw)) return;
-
-    const options = optionsRaw
-      .map((item) => {
-        if (!item || typeof item !== "object") return null;
-        const record = item as { id?: unknown; label?: unknown };
-        const id = typeof record.id === "string" ? record.id.trim() : "";
-        const label = typeof record.label === "string" ? record.label.trim() : "";
-        if (!id) return null;
-        return { id, label };
-      })
-      .filter((x): x is { id: string; label: string } => x !== null);
-
-    if (options.length === 0) {
-      setDefaultModelPresets();
-      restoreModelSelection(selection);
-      return;
-    }
-
-    setDefaultModelPresets();
-    const seen = new Set(Array.from(modelPresetEl.options).map((o) => o.value));
-    for (const opt of options) {
-      if (seen.has(opt.id)) continue;
-      seen.add(opt.id);
-      const el = document.createElement("option");
-      el.value = opt.id;
-      el.textContent = opt.label ? `${opt.id} — ${opt.label}` : opt.id;
-      modelPresetEl.append(el);
-    }
-    restoreModelSelection(selection);
-  } catch {
-    // ignore
-  }
-}
-
-let modelRefreshAt = 0;
-const refreshModelsIfStale = () => {
-  const now = Date.now();
-  if (now - modelRefreshAt < 1500) return;
-  modelRefreshAt = now;
-  void (async () => {
-    const token = (await loadSettings()).token;
-    await refreshModelPresets(token);
-  })();
-};
-
-let refreshFreeRunning = false;
-
-async function runRefreshFree() {
-  if (refreshFreeRunning) return;
-  const token = (await loadSettings()).token.trim();
-  if (!token) {
-    setModelStatus("Setup required (missing token).", "error");
-    return;
-  }
-  refreshFreeRunning = true;
-  modelRefreshBtn.disabled = true;
-  setModelStatus("Starting scan…", "running");
-  let winnerModel: string | null = null;
-
-  try {
-    const res = await fetch("http://127.0.0.1:8787/v1/refresh-free", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({}),
-    });
-    const json = (await res.json()) as { ok?: boolean; id?: string; error?: string };
-    if (!res.ok || !json.ok || !json.id) {
-      throw new Error(json.error || `${res.status} ${res.statusText}`);
-    }
-
-    const streamRes = await fetch(`http://127.0.0.1:8787/v1/refresh-free/${json.id}/events`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!streamRes.ok) throw new Error(`${streamRes.status} ${streamRes.statusText}`);
-    if (!streamRes.body) throw new Error("Missing stream body");
-
-    for await (const raw of parseSseStream(streamRes.body)) {
-      const event = parseSseEvent(raw);
-      if (!event) continue;
-      if (event.event === "status") {
-        const text = event.data.text.trim();
-        if (text) {
-          if (!winnerModel) {
-            const match = text.match(/^-\\s+([^\\s]+)/);
-            if (match?.[1]) winnerModel = match[1];
-          }
-          setModelStatus(text, "running");
-        }
-      } else if (event.event === "error") {
-        throw new Error(event.data.message);
-      } else if (event.event === "done") {
-        break;
-      }
-    }
-
-    const winnerNote = winnerModel ? ` Top: ${winnerModel}` : "";
-    setModelStatus(`Free models updated.${winnerNote}`, "ok");
-    await refreshModelPresets(token);
-  } catch (err) {
-    setModelStatus(friendlyFetchError(err, "Refresh free failed"), "error");
-  } finally {
-    refreshFreeRunning = false;
-    modelRefreshBtn.disabled = false;
-  }
-}
+const modelPresetsController = createModelPresetsController({
+  modelPresetEl,
+  modelCustomEl,
+  modelRefreshBtn,
+  modelStatusEl,
+  modelRowEl,
+  defaultModel: defaultSettings.model,
+  loadSettings,
+  friendlyFetchError,
+});
+const setModelStatus = modelPresetsController.setStatus;
+const setDefaultModelPresets = modelPresetsController.setDefaultPresets;
+const setModelPlaceholderFromDiscovery = modelPresetsController.setPlaceholderFromDiscovery;
+const readCurrentModelValue = modelPresetsController.readCurrentValue;
+const updateModelRowUI = modelPresetsController.updateRowUI;
+const setModelValue = modelPresetsController.setValue;
+const refreshModelPresets = modelPresetsController.refreshPresets;
+const refreshModelsIfStale = modelPresetsController.refreshIfStale;
+const runRefreshFree = modelPresetsController.runRefreshFree;
+const isRefreshFreeRunning = modelPresetsController.isRefreshFreeRunning;
 
 function handleSlidesStatus(text: string) {
   const trimmed = text.trim();
@@ -3059,243 +2349,24 @@ async function ensureToken(): Promise<string> {
   return token;
 }
 
-function installStepsHtml({
-  token,
-  headline,
-  message,
-  showTroubleshooting,
-}: {
-  token: string;
-  headline: string;
-  message?: string;
-  showTroubleshooting?: boolean;
-}) {
-  const npmCmd = "npm i -g @steipete/summarize";
-  const brewCmd = "brew install steipete/tap/summarize";
-  const daemonCmd = `summarize daemon install --token ${token}`;
-  const isMac = platformKind === "mac";
-  const isLinux = platformKind === "linux";
-  const isWindows = platformKind === "windows";
-  const isSupported = isMac || isLinux || isWindows;
-  const daemonLabel = isMac
-    ? "LaunchAgent"
-    : isLinux
-      ? "systemd user service"
-      : isWindows
-        ? "Scheduled Task"
-        : "daemon";
-
-  const installToggle = isMac
-    ? `
-      <div class="setup__toggle" role="tablist" aria-label="Install method">
-        <button class="setup__pill" type="button" data-install="npm" role="tab" aria-selected="false">NPM</button>
-        <button class="setup__pill" type="button" data-install="brew" role="tab" aria-selected="false">Homebrew</button>
-      </div>
-    `
-    : "";
-
-  const installIntro = `
-    <div class="setup__section">
-      <div class="setup__headerRow">
-        <p class="setup__title" data-install-title><strong>1) Install summarize</strong></p>
-        ${installToggle}
-      </div>
-      <div class="setup__codeRow">
-        <code data-install-code>${isMac ? brewCmd : npmCmd}</code>
-        <button class="ghost icon setup__copy" type="button" data-copy="install" aria-label="Copy install command">
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M8 6a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-8a2 2 0 0 1-2-2V6Zm-4 4a2 2 0 0 1 2-2h1v2H6v8h8v1a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-9Z" />
-          </svg>
-        </button>
-      </div>
-      <p class="setup__hint" data-install-hint>${
-        isMac
-          ? "Homebrew installs the daemon-ready binary (macOS arm64)."
-          : "Homebrew tap is macOS-only."
-      }</p>
-    </div>
-  `;
-
-  const daemonIntro = isSupported
-    ? `
-      <div class="setup__section">
-        <p class="setup__title"><strong>2) Register the daemon (${daemonLabel})</strong></p>
-        <div class="setup__codeRow">
-          <code data-daemon-code>${daemonCmd}</code>
-          <button class="ghost icon setup__copy" type="button" data-copy="daemon" aria-label="Copy daemon command">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M8 6a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-8a2 2 0 0 1-2-2V6Zm-4 4a2 2 0 0 1 2-2h1v2H6v8h8v1a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-9Z" />
-            </svg>
-          </button>
-        </div>
-      </div>
-    `
-    : `
-      <div class="setup__section">
-        <p class="setup__title"><strong>2) Daemon auto-start</strong></p>
-        <p class="setup__hint">Not supported on this OS yet.</p>
-      </div>
-    `;
-
-  const troubleshooting =
-    showTroubleshooting && isSupported
-      ? `
-      <div class="setup__section">
-        <p class="setup__title"><strong>Troubleshooting</strong></p>
-        <div class="setup__codeRow">
-          <code>summarize daemon status</code>
-          <button class="ghost icon setup__copy" type="button" data-copy="status" aria-label="Copy status command">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M8 6a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-8a2 2 0 0 1-2-2V6Zm-4 4a2 2 0 0 1 2-2h1v2H6v8h8v1a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-9Z" />
-            </svg>
-          </button>
-        </div>
-        <p class="setup__hint">Shows daemon health, version, and token auth status.</p>
-        <div class="setup__codeRow">
-          <code>summarize daemon restart</code>
-          <button class="ghost icon setup__copy" type="button" data-copy="restart" aria-label="Copy restart command">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M8 6a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-8a2 2 0 0 1-2-2V6Zm-4 4a2 2 0 0 1 2-2h1v2H6v8h8v1a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-9Z" />
-            </svg>
-          </button>
-        </div>
-        <p class="setup__hint">Restarts the daemon if it’s stuck or not responding.</p>
-      </div>
-    `
-      : "";
-
-  return `
-    <h2>${headline}</h2>
-    ${message ? `<p>${message}</p>` : ""}
-    ${installIntro}
-    ${daemonIntro}
-    <div class="setup__section setup__actions">
-      <button id="regen" type="button" class="ghost">Regenerate Token</button>
-    </div>
-    ${troubleshooting}
-  `;
-}
-
-function wireSetupButtons({
-  token,
-  showTroubleshooting,
-}: {
-  token: string;
-  showTroubleshooting?: boolean;
-}) {
-  const npmCmd = "npm i -g @steipete/summarize";
-  const brewCmd = "brew install steipete/tap/summarize";
-  const daemonCmd = `summarize daemon install --token ${token}`;
-  const isMac = platformKind === "mac";
-  const installMethodKey = "summarize.installMethod";
-  type InstallMethod = "npm" | "brew";
-  const resolveInstallMethod = (): InstallMethod => {
-    if (!isMac) return "npm";
-    try {
-      const stored = localStorage.getItem(installMethodKey);
-      if (stored === "npm" || stored === "brew") return stored;
-    } catch {
-      // ignore
-    }
-    return "brew";
-  };
-  const persistInstallMethod = (method: InstallMethod) => {
-    if (!isMac) return;
-    try {
-      localStorage.setItem(installMethodKey, method);
-    } catch {
-      // ignore
-    }
-  };
-
-  const flashCopied = () => {
-    headerController.setStatus("Copied");
-    setTimeout(() => headerController.setStatus(panelState.ui?.status ?? ""), 800);
-  };
-
-  const installTitleEl = setupEl.querySelector<HTMLElement>("[data-install-title]");
-  const installCodeEl = setupEl.querySelector<HTMLElement>("[data-install-code]");
-  const installHintEl = setupEl.querySelector<HTMLElement>("[data-install-hint]");
-  const installButtons = Array.from(setupEl.querySelectorAll<HTMLButtonElement>("[data-install]"));
-
-  const applyInstallMethod = (method: InstallMethod) => {
-    const label = method === "brew" ? "Homebrew" : "NPM";
-    if (installTitleEl) {
-      installTitleEl.innerHTML = `<strong>1) Install summarize (${label})</strong>`;
-    }
-    if (installCodeEl) {
-      installCodeEl.textContent = method === "brew" ? brewCmd : npmCmd;
-    }
-    if (installHintEl) {
-      if (!isMac) {
-        installHintEl.textContent = "Homebrew tap is macOS-only.";
-      } else if (method === "brew") {
-        installHintEl.textContent = "Homebrew installs the daemon-ready binary (macOS arm64).";
-      } else {
-        installHintEl.textContent = "NPM installs the CLI (requires Node.js).";
-      }
-    }
-    for (const button of installButtons) {
-      const isActive = button.dataset.install === method;
-      button.classList.toggle("isActive", isActive);
-      button.setAttribute("aria-selected", isActive ? "true" : "false");
-    }
-    persistInstallMethod(method);
-  };
-
-  const currentInstallMethod = resolveInstallMethod();
-  applyInstallMethod(currentInstallMethod);
-
-  for (const button of installButtons) {
-    button.addEventListener("click", () => {
-      const method = button.dataset.install === "brew" ? "brew" : "npm";
-      applyInstallMethod(method);
-    });
-  }
-
-  setupEl.querySelectorAll<HTMLButtonElement>("[data-copy]")?.forEach((button) => {
-    button.addEventListener("click", () => {
-      void (async () => {
-        const copyType = button.dataset.copy;
-        const installMethod = resolveInstallMethod();
-        const payload =
-          copyType === "install"
-            ? installMethod === "brew"
-              ? brewCmd
-              : npmCmd
-            : copyType === "daemon"
-              ? daemonCmd
-              : copyType === "status"
-                ? "summarize daemon status"
-                : copyType === "restart"
-                  ? "summarize daemon restart"
-                  : "";
-        if (!payload) return;
-        await navigator.clipboard.writeText(payload);
-        flashCopied();
-      })();
-    });
-  });
-
-  setupEl.querySelector<HTMLButtonElement>("#regen")?.addEventListener("click", () => {
-    void (async () => {
-      const token2 = generateToken();
-      await patchSettings({ token: token2 });
-      renderSetup(token2);
-    })();
-  });
-
-  if (!showTroubleshooting) return;
-}
-
 function renderSetup(token: string) {
   setupEl.classList.remove("hidden");
   setupEl.innerHTML = installStepsHtml({
     token,
     headline: "Setup",
     message: "Install summarize, then register the daemon so the side panel can stream summaries.",
+    platformKind,
   });
-  wireSetupButtons({ token });
+  wireSetupButtons({
+    setupEl,
+    token,
+    platformKind,
+    headerSetStatus: (text) => headerController.setStatus(text),
+    getStatusResetText: () => panelState.ui?.status ?? "",
+    patchSettings,
+    generateToken,
+    renderSetup,
+  });
 }
 
 function maybeShowSetup(state: UiState): boolean {
@@ -3315,10 +2386,20 @@ function maybeShowSetup(state: UiState): boolean {
           token: t,
           headline: "Daemon not reachable",
           message: state.daemon.error ?? "Check that the LaunchAgent is installed.",
+          platformKind,
           showTroubleshooting: true,
         })}
       `;
-      wireSetupButtons({ token: t, showTroubleshooting: true });
+      wireSetupButtons({
+        setupEl,
+        token: t,
+        platformKind,
+        headerSetStatus: (text) => headerController.setStatus(text),
+        getStatusResetText: () => panelState.ui?.status ?? "",
+        patchSettings,
+        generateToken,
+        renderSetup,
+      });
     });
     return true;
   }
@@ -3506,7 +2587,7 @@ function updateControls(state: UiState) {
     setModelValue(state.settings.model);
   }
   updateModelRowUI();
-  modelRefreshBtn.disabled = !state.settings.tokenPresent || refreshFreeRunning;
+  modelRefreshBtn.disabled = !state.settings.tokenPresent || isRefreshFreeRunning();
   if (panelState.currentSource) {
     if (
       shouldInvalidateCurrentSource({
@@ -3748,40 +2829,6 @@ function seedPlannedSlidesForRun(run: RunStart) {
   updateSlidesTextState();
   void requestSlidesContext();
   queueSlidesRender();
-}
-
-const timestampPattern = /\[(\d{1,2}:\d{2}(?::\d{2})?)\]/g;
-
-function linkifyTimestamps(content: string): string {
-  return content.replace(timestampPattern, (match, time) => {
-    const seconds = parseTimestampSeconds(time);
-    if (seconds == null) return match;
-    return `[${time}](timestamp:${seconds})`;
-  });
-}
-
-function parseTimestampSeconds(value: string): number | null {
-  const parts = value.split(":").map((part) => part.trim());
-  if (parts.length < 2 || parts.length > 3) return null;
-  const secondsPart = parts.pop();
-  if (!secondsPart) return null;
-  const seconds = Number(secondsPart);
-  if (!Number.isFinite(seconds) || seconds < 0) return null;
-  const minutesPart = parts.pop();
-  if (minutesPart == null) return null;
-  const minutes = Number(minutesPart);
-  if (!Number.isFinite(minutes) || minutes < 0) return null;
-  const hoursPart = parts.pop();
-  const hours = hoursPart != null ? Number(hoursPart) : 0;
-  if (!Number.isFinite(hours) || hours < 0) return null;
-  return Math.floor(hours * 3600 + minutes * 60 + seconds);
-}
-
-function parseTimestampHref(href: string): number | null {
-  const raw = href.slice("timestamp:".length).trim();
-  const seconds = Number(raw);
-  if (!Number.isFinite(seconds) || seconds < 0) return null;
-  return Math.floor(seconds);
 }
 
 function toggleDrawer(force?: boolean, opts?: { animate?: boolean }) {
