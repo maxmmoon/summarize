@@ -2,6 +2,10 @@
 
 ## 0.14.0 - UNRELEASED
 
+### Fixes
+
+- CLI auto models: include config-provided environment values when selecting `auto` candidates, so API keys in `~/.summarize/config.json` are honored for URL summaries (#206, fixes #205, thanks @kaihendry and @solomonneas).
+
 ## 0.13.2 - 2026-04-26
 
 ### Features
