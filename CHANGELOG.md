@@ -1,10 +1,15 @@
 # Changelog
 
-## 0.14.0 - 2026-04-26
+## 0.14.1 - 2026-04-26
 
 ### Features
 
 - Models: add OpenAI fast-service support via `--fast` / `--service-tier` and `--thinking`, keep `gpt-fast` / `fast` as compatibility aliases, and add explicit `codex-fast` for Codex CLI users.
+
+## 0.14.0 - 2026-04-26
+
+### Features
+
 - Chrome extension: add a background extractor router with Reddit thread `.json` extraction and diagnostics while preserving media URL hard-switch behavior (#207, fixes #174, thanks @solomonneas).
 - CLI extraction: support `--extract` for local PDF files through the existing markitdown preprocessing path, without requiring an LLM (#203, thanks @mvance).
 
